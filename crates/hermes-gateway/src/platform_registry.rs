@@ -538,6 +538,25 @@ pub async fn register_platforms(
                         app_id,
                         client_secret,
                         markdown_support: extra_bool(platform_cfg, "markdown_support", true),
+                        c2c_streaming: extra_bool(platform_cfg, "c2c_streaming", true),
+                        progress_coalesce: extra_bool(platform_cfg, "progress_coalesce", true),
+                        metadata_footer: extra_bool(platform_cfg, "metadata_footer", true),
+                        notify_on_stream_end: std::env::var("QQ_NOTIFY_ON_STREAM_END")
+                            .map(|v| {
+                                !matches!(
+                                    v.trim().to_ascii_lowercase().as_str(),
+                                    "0" | "false" | "off" | "no"
+                                )
+                            })
+                            .unwrap_or_else(|_| {
+                                extra_bool(platform_cfg, "notify_on_stream_end", true)
+                            }),
+                        max_progress_messages: platform_cfg
+                            .extra
+                            .get("max_progress_messages")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as usize)
+                            .unwrap_or(2),
                         proxy: Default::default(),
                     };
                     match QqBotAdapter::new(qq_cfg) {

@@ -15,7 +15,9 @@
 use clap::CommandFactory;
 use clap::Parser;
 use clap_complete::{generate, Shell as CompletionShell};
-use hermes_cli::app::provider_api_key_from_env;
+use hermes_cli::app::{
+    bridge_tool_registry, build_agent_config, build_provider, provider_api_key_from_env,
+};
 use hermes_cli::cli::{Cli, CliCommand};
 use hermes_cli::App;
 use hermes_config::{
@@ -23,15 +25,13 @@ use hermes_config::{
     platform_token_or_extra, save_config_yaml, state_dir, user_config_field_display,
     validate_config, ConfigError, PlatformConfig,
 };
-use hermes_core::AgentError;
-#[cfg(test)]
-use hermes_core::PlatformAdapter;
+use hermes_core::{AgentError, GatewayError, Message, MessageRole};
 use hermes_cron::{cron_scheduler_for_data_dir, CronError};
-#[cfg(test)]
-use hermes_gateway::Gateway;
+use hermes_gateway::{stream::StreamConfig, Gateway};
+use hermes_skills::{FileSkillStore, SkillManager};
 use hermes_telemetry::init_telemetry_from_env;
+use hermes_tools::ToolRegistry;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
 use std::sync::Arc;
 
 mod oauth_store;
@@ -485,7 +485,6 @@ async fn run_gateway(cli: Cli, action: Option<String>) -> Result<(), AgentError>
         }
         None | Some("start") => {
             println!("Starting Hermes Gateway...");
-            println!("Gateway start in engine mode uses `hermes serve` pipeline.");
             let pid_path = gateway_pid_path_for_cli(&cli);
             if let Some(pid) = read_gateway_pid(&pid_path) {
                 if gateway_pid_is_alive(pid) {
@@ -504,9 +503,147 @@ async fn run_gateway(cli: Cli, action: Option<String>) -> Result<(), AgentError>
             std::fs::write(&pid_path, format!("{}\n", std::process::id()))
                 .map_err(|e| AgentError::Io(format!("failed to write PID file: {}", e)))?;
 
-            println!("RuntimeBuilder is not enabled in engine-only mode.");
-            println!("Use `hermes serve start` to run API + gateway together.");
-            let res = Ok(());
+            let gateway_config = hermes_gateway::gateway::GatewayConfig {
+                streaming_enabled: config.streaming.enabled,
+                streaming: StreamConfig {
+                    edit_interval_ms: config.streaming.edit_interval_ms,
+                    buffer_threshold: config.streaming.buffer_threshold,
+                    max_message_length: config.streaming.max_message_length,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let gateway = Arc::new(Gateway::with_defaults(
+                Arc::new(hermes_gateway::SessionManager::new(config.session.clone())),
+                gateway_config,
+            ));
+
+            let agent = build_gateway_agent(&config, &cli).await?;
+            gateway
+                .set_message_handler_with_context(Arc::new(move |messages, ctx| {
+                    let agent = agent.clone();
+                    Box::pin(async move {
+                        let mut cfg = agent.config.clone();
+                        cfg.session_id = Some(ctx.session_key);
+                        cfg.platform = Some(ctx.platform);
+                        if let Some(model) = ctx.model {
+                            cfg.model = model;
+                        }
+                        if let Some(provider) = ctx.provider {
+                            cfg.provider = Some(provider);
+                        }
+                        if let Some(personality) = ctx.personality {
+                            cfg.personality = Some(personality);
+                        }
+                        if let Some(home) = ctx.home {
+                            cfg.hermes_home = Some(home);
+                        }
+                        let turn_agent = hermes_agent::AgentLoop::new(
+                            cfg,
+                            agent.tool_registry.clone(),
+                            agent.llm_provider.clone(),
+                        );
+                        let result = turn_agent.run(messages, None).await.map_err(|e| {
+                            GatewayError::Platform(format!("agent run failed: {}", e))
+                        })?;
+                        let text = last_assistant_text(&result.messages);
+                        if text.is_empty() {
+                            Err(GatewayError::Platform(
+                                "agent produced an empty response".to_string(),
+                            ))
+                        } else {
+                            Ok(text)
+                        }
+                    })
+                }))
+                .await;
+
+            let streaming_agent = build_gateway_agent(&config, &cli).await?;
+            gateway
+                .set_streaming_handler_with_context(Arc::new(move |messages, ctx, on_chunk| {
+                    let agent = streaming_agent.clone();
+                    Box::pin(async move {
+                        let mut cfg = agent.config.clone();
+                        cfg.session_id = Some(ctx.session_key);
+                        cfg.platform = Some(ctx.platform);
+                        if let Some(model) = ctx.model {
+                            cfg.model = model;
+                        }
+                        if let Some(provider) = ctx.provider {
+                            cfg.provider = Some(provider);
+                        }
+                        if let Some(personality) = ctx.personality {
+                            cfg.personality = Some(personality);
+                        }
+                        if let Some(home) = ctx.home {
+                            cfg.hermes_home = Some(home);
+                        }
+                        cfg.stream = true;
+                        let turn_agent = hermes_agent::AgentLoop::new(
+                            cfg,
+                            agent.tool_registry.clone(),
+                            agent.llm_provider.clone(),
+                        );
+                        let chunk_cb: Option<Box<dyn Fn(hermes_core::StreamChunk) + Send + Sync>> =
+                            Some(Box::new(move |chunk| {
+                                if let Some(content) = chunk.delta.and_then(|delta| delta.content) {
+                                    if !content.is_empty() {
+                                        on_chunk(content);
+                                    }
+                                }
+                            }));
+                        let result = turn_agent
+                            .run_stream(messages, None, chunk_cb)
+                            .await
+                            .map_err(|e| {
+                                GatewayError::Platform(format!("agent stream failed: {}", e))
+                            })?;
+                        let text = last_assistant_text(&result.messages);
+                        if text.is_empty() {
+                            Err(GatewayError::Platform(
+                                "agent produced an empty response".to_string(),
+                            ))
+                        } else {
+                            Ok(text)
+                        }
+                    })
+                }))
+                .await;
+
+            let mut sidecar_tasks = Vec::new();
+            let summary = register_gateway_adapters(&config, gateway.clone(), &mut sidecar_tasks)
+                .await
+                .map_err(|e| AgentError::Config(format!("gateway registration failed: {}", e)))?;
+            if !summary.errors.is_empty() {
+                for (platform, error) in &summary.errors {
+                    tracing::warn!(platform = %platform, error = %error, "gateway adapter registration skipped");
+                }
+            }
+            if summary.registered.is_empty() {
+                let _ = std::fs::remove_file(&pid_path);
+                return Err(AgentError::Config(
+                    "No enabled gateway adapters were registered; check platform config."
+                        .to_string(),
+                ));
+            }
+
+            println!(
+                "Registered gateway adapters: {}",
+                summary.registered.join(", ")
+            );
+            gateway
+                .start_all()
+                .await
+                .map_err(|e| AgentError::Io(format!("gateway start failed: {}", e)))?;
+            println!("Hermes Gateway running. Press Ctrl-C or send SIGTERM to stop.");
+            wait_for_shutdown_signal().await;
+            let res = gateway
+                .stop_all()
+                .await
+                .map_err(|e| AgentError::Io(format!("gateway stop failed: {}", e)));
+            for task in sidecar_tasks {
+                task.abort();
+            }
             let _ = std::fs::remove_file(&pid_path);
             return res;
         }
@@ -1029,7 +1166,6 @@ async fn run_gateway_setup(cli: &Cli) -> Result<(), AgentError> {
     Ok(())
 }
 
-#[cfg(test)]
 async fn register_gateway_adapters(
     config: &hermes_config::GatewayConfig,
     gateway: Arc<Gateway>,
@@ -1042,7 +1178,7 @@ async fn register_gateway_adapters(
     #[cfg(test)]
     {
         use async_trait::async_trait;
-        use hermes_core::{GatewayError, ParseMode};
+        use hermes_core::{GatewayError, ParseMode, PlatformAdapter};
 
         struct NoopAdapter {
             name: &'static str,
@@ -1120,6 +1256,65 @@ async fn register_gateway_adapters(
     }
 
     Ok(summary)
+}
+
+fn last_assistant_text(messages: &[Message]) -> String {
+    messages
+        .iter()
+        .rev()
+        .find(|m| matches!(m.role, MessageRole::Assistant))
+        .and_then(|m| m.content.as_deref())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+async fn build_gateway_agent(
+    config: &hermes_config::GatewayConfig,
+    cli: &Cli,
+) -> Result<Arc<hermes_agent::AgentLoop>, AgentError> {
+    let model = cli
+        .model
+        .clone()
+        .or_else(|| config.model.clone())
+        .unwrap_or_else(|| "gpt-4o".to_string());
+
+    let tool_registry = Arc::new(ToolRegistry::new());
+    let terminal_backend: Arc<dyn hermes_core::TerminalBackend> =
+        Arc::new(hermes_environments::LocalBackend::default());
+    let skill_store = Arc::new(FileSkillStore::new(FileSkillStore::default_dir()));
+    let skill_provider: Arc<dyn hermes_core::SkillProvider> =
+        Arc::new(SkillManager::new(skill_store));
+    hermes_tools::register_builtin_tools(&tool_registry, terminal_backend, skill_provider);
+    let _ = hermes_cli::live_messaging::enable_live_messaging_tool(config, &tool_registry).await;
+
+    let mut agent_config = build_agent_config(config, &model, Some("gateway"));
+    if let Some(personality) = &cli.personality {
+        agent_config.personality = Some(personality.clone());
+    }
+    let provider = build_provider(config, &model);
+    Ok(Arc::new(hermes_agent::AgentLoop::new(
+        agent_config,
+        Arc::new(bridge_tool_registry(&tool_registry)),
+        provider,
+    )))
+}
+
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = sigterm.recv() => {},
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
 }
 
 /// Default auth provider: CLI arg, then `HERMES_AUTH_DEFAULT_PROVIDER`, then `openai`.

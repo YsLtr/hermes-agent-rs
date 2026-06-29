@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
 use hermes_core::errors::GatewayError;
-use hermes_core::traits::{ParseMode, PlatformAdapter};
+use hermes_core::traits::{ParseMode, PlatformAdapter, PlatformTurnMetadata};
 use hermes_core::types::{Message, MessageRole};
 
 use crate::background::{BackgroundTaskManager, TaskStatus};
@@ -1096,6 +1096,10 @@ impl Gateway {
         let legacy_messages = self
             .inject_runtime_hints(session_key, messages.clone())
             .await;
+        let turn_started = std::time::Instant::now();
+        let first_token_at: Arc<StdMutex<Option<std::time::Instant>>> =
+            Arc::new(StdMutex::new(None));
+        let native_stream_requested = Arc::new(AtomicBool::new(false));
 
         // Start a stream
         let stream_handle = self
@@ -1103,17 +1107,39 @@ impl Gateway {
             .start_stream(&incoming.platform, &incoming.chat_id)
             .await;
         let stream_id = stream_handle.id.clone();
+        let gateway_adapters = self.adapters.read().await.clone();
+        let native_stream_adapter = gateway_adapters
+            .get(&incoming.platform)
+            .cloned()
+            .filter(|a| {
+                a.supports_native_streaming()
+                    && incoming.platform == "qqbot"
+                    && !incoming.chat_id.to_ascii_lowercase().starts_with("group_")
+                    && !incoming.chat_id.to_ascii_lowercase().starts_with("grp_")
+                    && !incoming
+                        .chat_id
+                        .to_ascii_lowercase()
+                        .starts_with("qqgroup_")
+            });
 
-        // Send an initial placeholder message
-        self.send_message(&incoming.platform, &incoming.chat_id, "...", None)
-            .await?;
+        // Send an initial placeholder only when the platform does not have
+        // a native stream protocol. QQ C2C stream chunks create/update their
+        // own message and a placeholder would ring as duplicate noise.
+        if native_stream_adapter.is_none() {
+            self.send_message(&incoming.platform, &incoming.chat_id, "...", None)
+                .await?;
+        }
 
         // Set up the chunk callback that updates the stream and edits the message
         let stream_manager = self.stream_manager.clone();
         let platform = incoming.platform.clone();
         let chat_id = incoming.chat_id.clone();
-        let gateway_adapters = self.adapters.read().await.clone();
         let sid = stream_id.clone();
+        let reply_to = incoming.message_id.clone();
+        let had_native_stream_adapter = native_stream_adapter.is_some();
+        let native_adapter_for_chunks = native_stream_adapter.clone();
+        let first_token_for_chunks = first_token_at.clone();
+        let native_requested_for_chunks = native_stream_requested.clone();
 
         let on_chunk: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |chunk: String| {
             let sm = stream_manager.clone();
@@ -1121,9 +1147,43 @@ impl Gateway {
             let platform = platform.clone();
             let chat_id = chat_id.clone();
             let adapters = gateway_adapters.clone();
+            let native_adapter = native_adapter_for_chunks.clone();
+            let reply_to = reply_to.clone();
+            let first_token_at = first_token_for_chunks.clone();
+            let native_requested = native_requested_for_chunks.clone();
+            if native_adapter.is_some() {
+                native_requested.store(true, Ordering::Release);
+            }
 
             tokio::spawn(async move {
-                if let Some(should_flush) = sm.update_stream(&sid, &chunk).await {
+                if !chunk.is_empty() {
+                    if let Ok(mut first) = first_token_at.lock() {
+                        if first.is_none() {
+                            *first = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+
+                let updated = sm.update_stream(&sid, &chunk).await;
+                if let Some(adapter) = native_adapter {
+                    match adapter
+                        .send_stream_chunk(&chat_id, &chunk, reply_to.as_deref(), false)
+                        .await
+                    {
+                        Ok(true) => return,
+                        Ok(false) => {}
+                        Err(err) => {
+                            warn!(
+                                platform = %platform,
+                                chat_id = %chat_id,
+                                error = %err,
+                                "native stream chunk failed; falling back to gateway send path"
+                            );
+                        }
+                    }
+                }
+
+                if let Some(should_flush) = updated {
                     if should_flush {
                         if let Some(content) = sm.get_stream_content(&sid).await {
                             if let Some(adapter) = adapters.get(&platform) {
@@ -1166,8 +1226,72 @@ impl Gateway {
             }
         };
 
-        // Finish the stream
-        self.stream_manager.finish_stream(&stream_id).await;
+        let final_content = self
+            .stream_manager
+            .finish_stream(&stream_id)
+            .await
+            .unwrap_or_default();
+        let mut native_delivered = false;
+        if let Some(adapter) = native_stream_adapter {
+            let ttft_ms = first_token_at
+                .lock()
+                .ok()
+                .and_then(|first| first.map(|instant| instant.duration_since(turn_started)))
+                .map(|duration| duration.as_millis() as u64);
+            let total_ms = turn_started.elapsed().as_millis() as u64;
+            let state = self
+                .runtime_state
+                .read()
+                .await
+                .get(session_key)
+                .cloned()
+                .unwrap_or_default();
+            adapter
+                .set_turn_metadata(
+                    &incoming.chat_id,
+                    PlatformTurnMetadata {
+                        model: state.model,
+                        provider: state.provider,
+                        ttft_ms,
+                        total_ms: Some(total_ms),
+                        tool_count: None,
+                    },
+                )
+                .await?;
+            let final_text = if native_stream_requested.load(Ordering::Acquire)
+                || !final_content.trim().is_empty()
+            {
+                // Native QQ stream chunks have already delivered the response
+                // incrementally. The final fragment closes the stream and
+                // carries metadata, matching the Python local patch's
+                // remaining-buffer flush semantics.
+                ""
+            } else if !response.trim().is_empty() {
+                response.as_str()
+            } else {
+                ""
+            };
+            native_delivered = adapter
+                .send_stream_chunk(
+                    &incoming.chat_id,
+                    final_text,
+                    incoming.message_id.as_deref(),
+                    true,
+                )
+                .await
+                .unwrap_or(false);
+            if native_delivered {
+                let notice_adapter = adapter.clone();
+                let chat_id = incoming.chat_id.clone();
+                tokio::spawn(async move {
+                    let _ = notice_adapter.send_stream_end_notice(&chat_id).await;
+                });
+            }
+        }
+        if had_native_stream_adapter && !native_delivered && !response.trim().is_empty() {
+            self.send_message(&incoming.platform, &incoming.chat_id, &response, None)
+                .await?;
+        }
 
         // Add assistant response to session
         self.session_manager
@@ -1812,6 +1936,14 @@ mod tests {
         messages: Arc<Mutex<Vec<(String, String)>>>,
     }
 
+    #[derive(Clone)]
+    struct NativeStreamTestAdapter {
+        messages: Arc<Mutex<Vec<(String, String)>>>,
+        chunks: Arc<Mutex<Vec<(String, String, bool)>>>,
+        metadata: Arc<Mutex<Vec<PlatformTurnMetadata>>>,
+        notices: Arc<Mutex<Vec<String>>>,
+    }
+
     struct RecordingHook {
         seen: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
     }
@@ -1878,6 +2010,88 @@ mod tests {
 
         fn platform_name(&self) -> &str {
             "test"
+        }
+    }
+
+    #[async_trait]
+    impl PlatformAdapter for NativeStreamTestAdapter {
+        async fn start(&self) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn stop(&self) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn send_message(
+            &self,
+            chat_id: &str,
+            text: &str,
+            _parse_mode: Option<ParseMode>,
+        ) -> Result<(), GatewayError> {
+            self.messages
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), text.to_string()));
+            Ok(())
+        }
+
+        async fn edit_message(
+            &self,
+            _chat_id: &str,
+            _message_id: &str,
+            _text: &str,
+        ) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        async fn send_file(
+            &self,
+            _chat_id: &str,
+            _file_path: &str,
+            _caption: Option<&str>,
+        ) -> Result<(), GatewayError> {
+            Ok(())
+        }
+
+        fn is_running(&self) -> bool {
+            true
+        }
+
+        fn platform_name(&self) -> &str {
+            "qqbot"
+        }
+
+        fn supports_native_streaming(&self) -> bool {
+            true
+        }
+
+        async fn set_turn_metadata(
+            &self,
+            _chat_id: &str,
+            meta: PlatformTurnMetadata,
+        ) -> Result<(), GatewayError> {
+            self.metadata.lock().unwrap().push(meta);
+            Ok(())
+        }
+
+        async fn send_stream_chunk(
+            &self,
+            chat_id: &str,
+            text: &str,
+            _reply_to: Option<&str>,
+            final_chunk: bool,
+        ) -> Result<bool, GatewayError> {
+            self.chunks
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), text.to_string(), final_chunk));
+            Ok(true)
+        }
+
+        async fn send_stream_end_notice(&self, chat_id: &str) -> Result<(), GatewayError> {
+            self.notices.lock().unwrap().push(chat_id.to_string());
+            Ok(())
         }
     }
 
@@ -2744,6 +2958,78 @@ mod tests {
         assert_eq!(
             cmd_events[0].1.get("text").and_then(|v| v.as_str()),
             Some("/nosuchplugincmd_xyz arg")
+        );
+    }
+
+    #[tokio::test]
+    async fn gateway_qqbot_native_stream_skips_placeholder_and_sends_final_notice() {
+        let messages = Arc::new(Mutex::new(Vec::new()));
+        let chunks = Arc::new(Mutex::new(Vec::new()));
+        let metadata = Arc::new(Mutex::new(Vec::new()));
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let adapter = Arc::new(NativeStreamTestAdapter {
+            messages: messages.clone(),
+            chunks: chunks.clone(),
+            metadata: metadata.clone(),
+            notices: notices.clone(),
+        });
+
+        let session_mgr = Arc::new(SessionManager::new(SessionConfig::default()));
+        let mut dm_manager = DmManager::with_pair_behavior();
+        dm_manager.authorize_user("user1");
+        let gw = Gateway::new(
+            session_mgr,
+            dm_manager,
+            GatewayConfig {
+                streaming_enabled: true,
+                streaming: StreamConfig {
+                    buffer_threshold: 1,
+                    ..StreamConfig::default()
+                },
+                ..GatewayConfig::default()
+            },
+        );
+        gw.register_adapter("qqbot", adapter).await;
+        gw.set_streaming_handler(Arc::new(|_messages, on_chunk| {
+            Box::pin(async move {
+                on_chunk("hello ".to_string());
+                on_chunk("qq".to_string());
+                Ok("hello qq".to_string())
+            })
+        }))
+        .await;
+
+        let incoming = IncomingMessage {
+            platform: "qqbot".into(),
+            chat_id: "openid-user".into(),
+            user_id: "user1".into(),
+            text: "stream please".into(),
+            message_id: Some("msg-1".into()),
+            is_dm: true,
+        };
+        assert!(gw.route_message(&incoming).await.is_ok());
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        assert!(
+            messages.lock().unwrap().is_empty(),
+            "native QQ stream should not send placeholder or duplicate final message"
+        );
+        let chunks = chunks.lock().unwrap();
+        assert!(chunks
+            .iter()
+            .any(|(_, text, final_chunk)| text == "hello " && !final_chunk));
+        assert!(chunks
+            .iter()
+            .any(|(_, text, final_chunk)| text == "qq" && !final_chunk));
+        assert!(chunks
+            .iter()
+            .any(|(_, text, final_chunk)| text.is_empty() && *final_chunk));
+        drop(chunks);
+
+        assert_eq!(metadata.lock().unwrap().len(), 1);
+        assert_eq!(
+            notices.lock().unwrap().as_slice(),
+            &["openid-user".to_string()]
         );
     }
 

@@ -65,6 +65,16 @@ pub enum ParseMode {
     Html,
 }
 
+/// Optional metadata a platform can append to a final turn.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct PlatformTurnMetadata {
+    pub model: Option<String>,
+    pub provider: Option<String>,
+    pub ttft_ms: Option<u64>,
+    pub total_ms: Option<u64>,
+    pub tool_count: Option<u32>,
+}
+
 /// Trait for platform communication adapters (Telegram, Discord, etc.).
 #[async_trait]
 pub trait PlatformAdapter: Send + Sync {
@@ -103,6 +113,52 @@ pub trait PlatformAdapter: Send + Sync {
 
     /// Return the name of this platform (e.g. "telegram", "discord").
     fn platform_name(&self) -> &str;
+
+    /// Whether this adapter can stream deltas with a platform-native protocol
+    /// instead of gateway-managed edit/send fallback.
+    fn supports_native_streaming(&self) -> bool {
+        false
+    }
+
+    /// Whether this adapter can display progress without message editing.
+    fn supports_progress_without_edit(&self) -> bool {
+        false
+    }
+
+    /// Set per-turn metadata for final stream/footer rendering.
+    async fn set_turn_metadata(
+        &self,
+        _chat_id: &str,
+        _meta: PlatformTurnMetadata,
+    ) -> Result<(), GatewayError> {
+        Ok(())
+    }
+
+    /// Send one native stream fragment. Returns true when the platform accepted
+    /// the fragment and the gateway should consider it delivered.
+    async fn send_stream_chunk(
+        &self,
+        _chat_id: &str,
+        _text: &str,
+        _reply_to: Option<&str>,
+        _final: bool,
+    ) -> Result<bool, GatewayError> {
+        Ok(false)
+    }
+
+    /// Send a coalesced progress card for platforms without edit support.
+    async fn send_progress_card(
+        &self,
+        _chat_id: &str,
+        _lines: &[String],
+    ) -> Result<(), GatewayError> {
+        Ok(())
+    }
+
+    /// Optional audible/visible notification after a streamed turn finishes.
+    async fn send_stream_end_notice(&self, _chat_id: &str) -> Result<(), GatewayError> {
+        Ok(())
+    }
 
     /// Periodic maintenance: prune token caches, dedup maps, etc.
     ///
