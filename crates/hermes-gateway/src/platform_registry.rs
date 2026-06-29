@@ -561,7 +561,15 @@ pub async fn register_platforms(
                     };
                     match QqBotAdapter::new(qq_cfg) {
                         Ok(adapter) => {
-                            gateway.register_adapter("qqbot", Arc::new(adapter)).await;
+                            let adapter = Arc::new(adapter);
+                            let (inbound_tx, inbound_rx) =
+                                tokio::sync::mpsc::channel::<crate::gateway::IncomingMessage>(256);
+                            adapter.set_inbound_sender(inbound_tx).await;
+                            let inbound_task = gateway
+                                .register_adapter_with_inbound("qqbot", adapter.clone(), inbound_rx)
+                                .await;
+                            sidecar_tasks.push(inbound_task);
+                            sidecar_tasks.push(adapter.clone().spawn_inbound());
                             registered.push("qqbot".to_string());
                         }
                         Err(e) => errors.push(("qqbot".to_string(), e.to_string())),

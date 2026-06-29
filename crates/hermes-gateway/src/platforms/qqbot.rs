@@ -4,18 +4,22 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::{SinkExt, StreamExt};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Notify, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tracing::{debug, info, warn};
 
 use hermes_core::errors::GatewayError;
 use hermes_core::traits::{ParseMode, PlatformAdapter, PlatformTurnMetadata};
 
 use crate::adapter::{AdapterProxyConfig, BasePlatformAdapter};
+use crate::gateway::IncomingMessage;
 
 const QQ_TOKEN_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
+const QQ_GATEWAY_URL: &str = "https://api.sgroup.qq.com/gateway";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QqBotConfig {
@@ -43,10 +47,18 @@ pub struct QqBotAdapter {
     client: Client,
     stop_signal: Arc<Notify>,
     access_token: RwLock<Option<(String, Instant)>>,
+    inbound_tx: RwLock<Option<mpsc::Sender<IncomingMessage>>>,
+    ws_state: Mutex<QqWsState>,
     c2c_stream_state: Mutex<std::collections::HashMap<String, C2cStreamState>>,
     turn_metadata: Mutex<std::collections::HashMap<String, PlatformTurnMetadata>>,
     progress_state: Mutex<std::collections::HashMap<String, ProgressState>>,
     notice_state: Mutex<StreamNoticeState>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct QqWsState {
+    session_id: Option<String>,
+    last_seq: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -108,11 +120,21 @@ impl QqBotAdapter {
             client,
             stop_signal: Arc::new(Notify::new()),
             access_token: RwLock::new(None),
+            inbound_tx: RwLock::new(None),
+            ws_state: Mutex::new(QqWsState::default()),
             c2c_stream_state: Mutex::new(std::collections::HashMap::new()),
             turn_metadata: Mutex::new(std::collections::HashMap::new()),
             progress_state: Mutex::new(std::collections::HashMap::new()),
             notice_state: Mutex::new(StreamNoticeState::default()),
         })
+    }
+
+    pub async fn set_inbound_sender(&self, tx: mpsc::Sender<IncomingMessage>) {
+        *self.inbound_tx.write().await = Some(tx);
+    }
+
+    pub fn spawn_inbound(self: Arc<Self>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move { self.websocket_supervisor().await })
     }
 
     async fn get_access_token(&self) -> Result<String, GatewayError> {
@@ -232,6 +254,280 @@ impl QqBotAdapter {
         resp.json()
             .await
             .map_err(|e| GatewayError::SendFailed(format!("QQBot send parse failed: {e}")))
+    }
+
+    async fn get_gateway_url(&self) -> Result<String, GatewayError> {
+        let token = self.get_access_token().await?;
+        let resp = self
+            .client
+            .get(QQ_GATEWAY_URL)
+            .header("Authorization", format!("QQBot {token}"))
+            .header("User-Agent", "hermes-agent-rs")
+            .send()
+            .await
+            .map_err(|e| {
+                GatewayError::ConnectionFailed(format!("QQ gateway request failed: {e}"))
+            })?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(GatewayError::ConnectionFailed(format!(
+                "QQ gateway endpoint returned {status}: {text}"
+            )));
+        }
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| GatewayError::ConnectionFailed(format!("QQ gateway parse failed: {e}")))?;
+        value
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| GatewayError::ConnectionFailed("QQ gateway response missing url".into()))
+    }
+
+    async fn websocket_supervisor(self: Arc<Self>) {
+        let mut backoff = Duration::from_secs(2);
+        while !self.base.is_running() {
+            tokio::select! {
+                _ = self.stop_signal.notified() => return,
+                _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+            }
+        }
+
+        while self.base.is_running() {
+            match self.run_websocket_once().await {
+                Ok(()) => {
+                    backoff = Duration::from_secs(2);
+                }
+                Err(e) => {
+                    warn!("QQBot websocket disconnected: {}", e);
+                    tokio::select! {
+                        _ = self.stop_signal.notified() => return,
+                        _ = tokio::time::sleep(backoff) => {}
+                    }
+                    backoff = (backoff * 2).min(Duration::from_secs(60));
+                }
+            }
+        }
+    }
+
+    async fn run_websocket_once(&self) -> Result<(), GatewayError> {
+        let gateway_url = self.get_gateway_url().await?;
+        let (ws, _) = tokio_tungstenite::connect_async(&gateway_url)
+            .await
+            .map_err(|e| {
+                GatewayError::ConnectionFailed(format!("QQ websocket connect failed: {e}"))
+            })?;
+        info!("QQBot websocket connected");
+        let (mut write, mut read) = ws.split();
+        let mut heartbeat: Option<tokio::time::Interval> = None;
+
+        loop {
+            tokio::select! {
+                _ = self.stop_signal.notified() => {
+                    let _ = write.close().await;
+                    return Ok(());
+                }
+                _ = async {
+                    if let Some(interval) = &mut heartbeat {
+                        interval.tick().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                } => {
+                    let seq = self.ws_state.lock().await.last_seq;
+                    write
+                        .send(WsMessage::Text(serde_json::json!({"op": 1, "d": seq}).to_string()))
+                        .await
+                        .map_err(|e| GatewayError::ConnectionFailed(format!("QQ heartbeat failed: {e}")))?;
+                }
+                msg = read.next() => {
+                    let Some(msg) = msg else {
+                        return Err(GatewayError::ConnectionFailed("QQ websocket closed".into()));
+                    };
+                    let msg = msg.map_err(|e| GatewayError::ConnectionFailed(format!("QQ websocket read failed: {e}")))?;
+                    match msg {
+                        WsMessage::Text(text) => {
+                            let value: serde_json::Value = serde_json::from_str(&text)
+                                .map_err(|e| GatewayError::Platform(format!("QQ websocket JSON parse failed: {e}")))?;
+                            if let Some(interval_ms) = self.handle_ws_payload(&value, &mut write).await? {
+                                let every = Duration::from_millis((interval_ms as f64 * 0.8) as u64);
+                                heartbeat = Some(tokio::time::interval(every.max(Duration::from_secs(1))));
+                            }
+                        }
+                        WsMessage::Close(frame) => {
+                            return Err(GatewayError::ConnectionFailed(format!("QQ websocket close: {:?}", frame)));
+                        }
+                        WsMessage::Ping(data) => {
+                            let _ = write.send(WsMessage::Pong(data)).await;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    async fn handle_ws_payload<S>(
+        &self,
+        value: &serde_json::Value,
+        write: &mut S,
+    ) -> Result<Option<u64>, GatewayError>
+    where
+        S: futures::Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        let op = value.get("op").and_then(|v| v.as_i64());
+        if let Some(seq) = value.get("s").and_then(|v| v.as_i64()) {
+            self.ws_state.lock().await.last_seq = Some(seq);
+        }
+
+        match op {
+            Some(10) => {
+                let interval_ms = value
+                    .get("d")
+                    .and_then(|d| d.get("heartbeat_interval"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(30_000);
+                self.send_identify_or_resume(write).await?;
+                Ok(Some(interval_ms))
+            }
+            Some(0) => {
+                let event_type = value.get("t").and_then(|v| v.as_str()).unwrap_or("");
+                let data = value.get("d").unwrap_or(&serde_json::Value::Null);
+                match event_type {
+                    "READY" => {
+                        if let Some(session_id) = data.get("session_id").and_then(|v| v.as_str()) {
+                            self.ws_state.lock().await.session_id = Some(session_id.to_string());
+                            info!("QQBot websocket ready");
+                        }
+                    }
+                    "C2C_MESSAGE_CREATE"
+                    | "GROUP_AT_MESSAGE_CREATE"
+                    | "DIRECT_MESSAGE_CREATE"
+                    | "GUILD_MESSAGE_CREATE"
+                    | "GUILD_AT_MESSAGE_CREATE" => {
+                        self.dispatch_inbound_message(event_type, data).await;
+                    }
+                    other => debug!("QQBot unhandled websocket event: {}", other),
+                }
+                Ok(None)
+            }
+            Some(7) | Some(9) => Err(GatewayError::ConnectionFailed(
+                "QQ gateway requested reconnect".into(),
+            )),
+            Some(11) => Ok(None),
+            _ => Ok(None),
+        }
+    }
+
+    async fn send_identify_or_resume<S>(&self, write: &mut S) -> Result<(), GatewayError>
+    where
+        S: futures::Sink<WsMessage, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+    {
+        let token = self.get_access_token().await?;
+        let state = self.ws_state.lock().await.clone();
+        let payload = if let (Some(session_id), Some(seq)) = (state.session_id, state.last_seq) {
+            serde_json::json!({
+                "op": 6,
+                "d": {
+                    "token": format!("QQBot {token}"),
+                    "session_id": session_id,
+                    "seq": seq
+                }
+            })
+        } else {
+            serde_json::json!({
+                "op": 2,
+                "d": {
+                    "token": format!("QQBot {token}"),
+                    "intents": (1u64 << 25) | (1u64 << 30) | (1u64 << 12) | (1u64 << 26),
+                    "shard": [0, 1],
+                    "properties": {
+                        "$os": "linux",
+                        "$browser": "hermes-agent-rs",
+                        "$device": "hermes-agent-rs"
+                    }
+                }
+            })
+        };
+        write
+            .send(WsMessage::Text(payload.to_string()))
+            .await
+            .map_err(|e| GatewayError::ConnectionFailed(format!("QQ identify failed: {e}")))
+    }
+
+    async fn dispatch_inbound_message(&self, event_type: &str, data: &serde_json::Value) {
+        let Some(tx) = self.inbound_tx.read().await.clone() else {
+            warn!("QQBot inbound message dropped because no gateway receiver is configured");
+            return;
+        };
+        let msg_id = data.get("id").and_then(|v| v.as_str()).map(str::to_string);
+        let text = data
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            return;
+        }
+        let author = data.get("author").and_then(|v| v.as_object());
+        let (chat_id, user_id, is_dm) = match event_type {
+            "C2C_MESSAGE_CREATE" => {
+                let id = author
+                    .and_then(|a| a.get("user_openid"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (id.to_string(), id.to_string(), false)
+            }
+            "GROUP_AT_MESSAGE_CREATE" => {
+                let group = data
+                    .get("group_openid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let user = author
+                    .and_then(|a| a.get("member_openid"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (group.to_string(), user.to_string(), false)
+            }
+            "DIRECT_MESSAGE_CREATE" => {
+                let guild = data.get("guild_id").and_then(|v| v.as_str()).unwrap_or("");
+                let user = author
+                    .and_then(|a| a.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (guild.to_string(), user.to_string(), false)
+            }
+            "GUILD_MESSAGE_CREATE" | "GUILD_AT_MESSAGE_CREATE" => {
+                let channel = data
+                    .get("channel_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let user = author
+                    .and_then(|a| a.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                (channel.to_string(), user.to_string(), false)
+            }
+            _ => return,
+        };
+        if chat_id.is_empty() || user_id.is_empty() {
+            return;
+        }
+        let incoming = IncomingMessage {
+            platform: "qqbot".to_string(),
+            chat_id,
+            user_id,
+            text,
+            message_id: msg_id,
+            is_dm,
+        };
+        if let Err(e) = tx.send(incoming).await {
+            warn!("QQBot inbound message queue send failed: {}", e);
+        }
     }
 
     async fn send_text_inner(
