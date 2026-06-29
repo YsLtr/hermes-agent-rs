@@ -6,6 +6,49 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 ---
 
+## Active Handoff — 2026-06-29 20:17 CST
+
+Current objective: continue validating and hardening the Rust rewrite of Hermes, especially QQ Bot gateway behavior on Armbian, while preserving parity with the customized Python Hermes installation.
+
+Latest state:
+- QQ streaming truncation and Markdown rendering were fixed and released.
+- Latest commit: `70b0941 fix(qqbot): keep native stream markdown consistent`.
+- Latest release deployed to Armbian: `v0.1.1-armbian.7`, built by GitHub Actions run `28371005960` in fork `YsLtr/hermes-agent-rs`.
+- Armbian service: `hermes-rs-gateway.service` is active, running `/root/.local/bin/hermes-rs -C /root/.hermes-rs gateway start`.
+- Last observed remote resource use after deploy: RSS about 17 MB, CPU about 0.2%; QQ WebSocket connected and ready.
+- Old Python service `hermes-gateway.service` remains stopped/disabled from earlier testing.
+
+Important implementation details:
+- `crates/hermes-gateway/src/platforms/qqbot.rs`: QQ native C2C stream now prefers `msg_type=2` Markdown for every chunk and locks the message type per stream to avoid `40034016 流式消息msgtype不同`; fallback to text locks the stream to text.
+- `crates/hermes-gateway/src/gateway.rs`: final native stream chunk now carries the final response text instead of an empty close-only chunk.
+- `crates/hermes-core/src/tool_call_parser.rs` and `crates/hermes-agent/src/agent_loop.rs`: compact provider text tool tags like `<tool_call>gif_search<arg_key>query</arg_key>...` are parsed and promoted to real tool calls.
+- `crates/hermes-cli/src/main.rs`: gateway streaming callback filters compact tool-call tags so they do not leak to QQ users while the loop executes tools.
+
+Validation already done:
+- Local tests/checks passed before release:
+  - `cargo fmt --all`
+  - `cargo test -p hermes-core test_parse_compact_tool_call_tags -- --nocapture`
+  - `cargo test -p hermes-gateway gateway_qqbot_native_stream_skips_placeholder_and_sends_final_notice -- --nocapture`
+  - `cargo check -p hermes-agent -p hermes-gateway -p hermes-cli --all-targets`
+- Local debug gateway was tested with copied Armbian config at `/tmp/hermes-rs-local-test`; QQ output stopped truncating and Markdown rendered normally after the `msg_type=2` stream fix.
+
+Operational notes:
+- User prefers not compiling on the Armbian board for releases; use GitHub Actions for ARM64 release builds unless explicitly testing a local debug binary.
+- Fork remote for pushes/releases: `ysltr git@github.com:YsLtr/hermes-agent-rs.git`; upstream `origin` push previously failed with 403.
+- Armbian host: `root@192.168.11.11`; password was provided in chat. Use existing SSH helper scripts if needed.
+- Remote config: `/root/.hermes-rs/config.yaml`; original Python config/env live under `/root/.hermes/`.
+- User explicitly allowed copying existing secrets/config during this debugging session, but avoid committing secrets.
+
+Open risks / next steps:
+- Continue real QQ testing for longer tool loops and web/search/image tools; some failures seen during local testing were upstream LLM `429 Too Many Requests`, not gateway errors.
+- If QQ stream regressions recur, compare against Python custom implementation at `/root/.hermes/hermes-agent/gateway/platforms/qqbot/adapter.py`, especially `send_c2c_stream_chunk`.
+- Consider making native streaming vs ordinary Markdown final-message behavior configurable if the user wants notification/audio or different rendering tradeoffs.
+- Monitor logs for `40034016`, `40034021`, or `40054018` after more real traffic.
+
+Suggested skills next session: `diagnose` for runtime QQ/tool-loop issues, `ssh-connect` for Armbian inspection, `handoff` before ending a long debugging session.
+
+---
+
 ## Build & Test
 
 ```bash
