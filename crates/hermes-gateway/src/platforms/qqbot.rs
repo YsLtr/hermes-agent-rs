@@ -711,49 +711,23 @@ impl PlatformAdapter for QqBotAdapter {
             stream_payload["id"] = serde_json::Value::String(id.clone());
         }
 
-        let mut body = if self.config.markdown_support {
-            serde_json::json!({
-                "msg_type": 2,
-                "markdown": { "content": content },
-                "msg_seq": Self::next_msg_seq(chat_id),
-                "stream": stream_payload
-            })
-        } else {
-            serde_json::json!({
-                "msg_type": 0,
-                "content": content,
-                "msg_seq": Self::next_msg_seq(chat_id),
-                "stream": stream_payload
-            })
-        };
+        // QQ requires every chunk in one stream to use the same msg_type.
+        // Markdown stream support is inconsistent for C2C, so keep native
+        // stream chunks on plain text and leave markdown_support for normal
+        // messages only.
+        let mut body = serde_json::json!({
+            "msg_type": 0,
+            "content": content,
+            "msg_seq": Self::next_msg_seq(chat_id),
+            "stream": stream_payload
+        });
         if let Some(reply_to) = reply_to.filter(|s| !s.trim().is_empty()) {
             body["msg_id"] = serde_json::Value::String(reply_to.to_string());
         }
 
         let endpoint = format!("{QQ_API_BASE}/v2/users/{chat_id}/messages");
         drop(states);
-        let result = self.post_qq_message(&endpoint, body.clone()).await;
-        let data = match result {
-            Ok(data) => data,
-            Err(err) if self.config.markdown_support => {
-                let lowered = err.to_string().to_ascii_lowercase();
-                if lowered.contains("markdown")
-                    || lowered.contains("md")
-                    || lowered.contains("not allowed")
-                {
-                    warn!("QQBot stream markdown rejected, falling back to plain text");
-                    body.as_object_mut().map(|obj| {
-                        obj.remove("markdown");
-                        obj.insert("msg_type".to_string(), serde_json::json!(0));
-                        obj.insert("content".to_string(), serde_json::json!(content));
-                    });
-                    self.post_qq_message(&endpoint, body).await?
-                } else {
-                    return Err(err);
-                }
-            }
-            Err(err) => return Err(err),
-        };
+        let data = self.post_qq_message(&endpoint, body).await?;
 
         let mut states = self.c2c_stream_state.lock().await;
         let state = states.entry(chat_id.to_string()).or_default();
