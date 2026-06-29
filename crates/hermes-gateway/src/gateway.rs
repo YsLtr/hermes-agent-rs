@@ -1296,16 +1296,12 @@ impl Gateway {
                     },
                 )
                 .await?;
-            let final_text = if native_stream_requested.load(Ordering::Acquire)
-                || !final_content.trim().is_empty()
-            {
-                // Native QQ stream chunks have already delivered the response
-                // incrementally. The final fragment closes the stream and
-                // carries metadata, matching the Python local patch's
-                // remaining-buffer flush semantics.
-                ""
-            } else if !response.trim().is_empty() {
+            let final_text = if !response.trim().is_empty() {
                 response.as_str()
+            } else if !final_content.trim().is_empty() {
+                final_content.as_str()
+            } else if native_stream_requested.load(Ordering::Acquire) {
+                ""
             } else {
                 ""
             };
@@ -3155,7 +3151,7 @@ mod tests {
             .any(|(_, text, final_chunk)| text == "hello qq" && !final_chunk));
         assert!(chunks
             .iter()
-            .any(|(_, text, final_chunk)| text.is_empty() && *final_chunk));
+            .any(|(_, text, final_chunk)| text == "hello qq" && *final_chunk));
         drop(chunks);
 
         assert_eq!(metadata.lock().unwrap().len(), 1);

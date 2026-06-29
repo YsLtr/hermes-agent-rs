@@ -66,6 +66,7 @@ struct C2cStreamState {
     id: Option<String>,
     index: u64,
     active: bool,
+    msg_type: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -711,29 +712,75 @@ impl PlatformAdapter for QqBotAdapter {
             stream_payload["id"] = serde_json::Value::String(id.clone());
         }
 
-        // QQ requires every chunk in one stream to use the same msg_type.
-        // Markdown stream support is inconsistent for C2C, so keep native
-        // stream chunks on plain text and leave markdown_support for normal
-        // messages only.
-        let mut body = serde_json::json!({
-            "msg_type": 0,
-            "content": content,
-            "msg_seq": Self::next_msg_seq(chat_id),
-            "stream": stream_payload
-        });
+        let use_markdown = self.config.markdown_support && state.msg_type != Some(0);
+        let mut body = if use_markdown {
+            serde_json::json!({
+                "msg_type": 2,
+                "markdown": { "content": content },
+                "msg_seq": Self::next_msg_seq(chat_id),
+                "stream": stream_payload
+            })
+        } else {
+            serde_json::json!({
+                "msg_type": 0,
+                "content": content,
+                "msg_seq": Self::next_msg_seq(chat_id),
+                "stream": stream_payload
+            })
+        };
         if let Some(reply_to) = reply_to.filter(|s| !s.trim().is_empty()) {
             body["msg_id"] = serde_json::Value::String(reply_to.to_string());
         }
 
         let endpoint = format!("{QQ_API_BASE}/v2/users/{chat_id}/messages");
+        debug!(
+            chat_id = %chat_id,
+            final_chunk,
+            content_chars = content.chars().count(),
+            stream_state = if final_chunk { 10 } else { 1 },
+            msg_type = if use_markdown { 2 } else { 0 },
+            stream_id = state.id.as_deref().unwrap_or(""),
+            stream_index = state.index,
+            "QQBot sending native stream chunk"
+        );
         drop(states);
-        let data = self.post_qq_message(&endpoint, body).await?;
+        let mut actual_msg_type = if use_markdown { 2 } else { 0 };
+        let result = self.post_qq_message(&endpoint, body.clone()).await;
+        let data = match result {
+            Ok(data) => data,
+            Err(err) if use_markdown => {
+                let lowered = err.to_string().to_ascii_lowercase();
+                let text = err.to_string();
+                if lowered.contains("markdown")
+                    || lowered.contains("md")
+                    || lowered.contains("not allowed")
+                    || text.contains("markdown")
+                    || text.contains("消息类型")
+                {
+                    warn!("QQBot stream markdown rejected, locking stream to plain text");
+                    body.as_object_mut().map(|obj| {
+                        obj.remove("markdown");
+                        obj.insert("msg_type".to_string(), serde_json::json!(0));
+                        obj.insert("content".to_string(), serde_json::json!(content));
+                    });
+                    actual_msg_type = 0;
+                    let data = self.post_qq_message(&endpoint, body).await?;
+                    let mut states = self.c2c_stream_state.lock().await;
+                    states.entry(chat_id.to_string()).or_default().msg_type = Some(0);
+                    data
+                } else {
+                    return Err(err);
+                }
+            }
+            Err(err) => return Err(err),
+        };
 
         let mut states = self.c2c_stream_state.lock().await;
         let state = states.entry(chat_id.to_string()).or_default();
         if final_chunk {
             *state = C2cStreamState::default();
         } else {
+            state.msg_type = Some(actual_msg_type);
             state.id = data
                 .get("id")
                 .and_then(|v| v.as_str())
