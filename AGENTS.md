@@ -6,46 +6,55 @@ Instructions for AI coding assistants and developers working on the hermes-agent
 
 ---
 
-## Active Handoff — 2026-06-29 20:17 CST
+## Active Handoff — 2026-06-29 20:48 CST
 
-Current objective: continue validating and hardening the Rust rewrite of Hermes, especially QQ Bot gateway behavior on Armbian, while preserving parity with the customized Python Hermes installation.
+Current objective: 完善 Rust 版 Hermes，根据原版 Python 实现补全缺失功能，优先解决 QQ bot 工具调用无反馈和进度指示问题。
 
 Latest state:
-- QQ streaming truncation and Markdown rendering were fixed and released.
-- Latest commit: `70b0941 fix(qqbot): keep native stream markdown consistent`.
-- Latest release deployed to Armbian: `v0.1.1-armbian.7`, built by GitHub Actions run `28371005960` in fork `YsLtr/hermes-agent-rs`.
-- Armbian service: `hermes-rs-gateway.service` is active, running `/root/.local/bin/hermes-rs -C /root/.hermes-rs gateway start`.
-- Last observed remote resource use after deploy: RSS about 17 MB, CPU about 0.2%; QQ WebSocket connected and ready.
-- Old Python service `hermes-gateway.service` remains stopped/disabled from earlier testing.
+- **Typing indicator 已实现（未测试）**：
+  - `PlatformAdapter` trait 新增 `send_typing()` 方法
+  - QQ bot adapter 实现完整的 typing indicator（msg_type=6 input_notify，50秒防抖）
+  - Gateway 在 `route_streaming` 和 `route_non_streaming` 开始时发送 typing
+  - 消息 ID 跟踪已添加到 `dispatch_inbound_message`
+- **已停止 Armbian 服务**：`hermes-rs-gateway.service` 当前 inactive
+- **本地 debug 构建完成**：`target/debug/hermes` 编译通过，可用 `/tmp/hermes-rs-local-test` 配置测试
+- **未提交的更改**：
+  - `crates/hermes-core/src/traits.rs`：新增 `send_typing()` trait 方法
+  - `crates/hermes-gateway/src/gateway.rs`：路由开始时调用 typing indicator
+  - `crates/hermes-gateway/src/platforms/qqbot.rs`：完整 typing 实现 + 状态跟踪
 
-Important implementation details:
-- `crates/hermes-gateway/src/platforms/qqbot.rs`: QQ native C2C stream now prefers `msg_type=2` Markdown for every chunk and locks the message type per stream to avoid `40034016 流式消息msgtype不同`; fallback to text locks the stream to text.
-- `crates/hermes-gateway/src/gateway.rs`: final native stream chunk now carries the final response text instead of an empty close-only chunk.
-- `crates/hermes-core/src/tool_call_parser.rs` and `crates/hermes-agent/src/agent_loop.rs`: compact provider text tool tags like `<tool_call>gif_search<arg_key>query</arg_key>...` are parsed and promoted to real tool calls.
-- `crates/hermes-cli/src/main.rs`: gateway streaming callback filters compact tool-call tags so they do not leak to QQ users while the loop executes tools.
+Reference implementation 已拉取到 `/tmp/ref-qqbot/adapter.py`（3564 行 Python），关键发现：
+- 原版在工具执行期间通过 `send_progress_card()` 发送进度
+- 原版在 `run.py` 中调用 `send_typing()` before agent loop starts
+- 原版通过 `send_progress_lines` 累积工具名称并定期刷新进度卡片
 
-Validation already done:
-- Local tests/checks passed before release:
-  - `cargo fmt --all`
-  - `cargo test -p hermes-core test_parse_compact_tool_call_tags -- --nocapture`
-  - `cargo test -p hermes-gateway gateway_qqbot_native_stream_skips_placeholder_and_sends_final_notice -- --nocapture`
-  - `cargo check -p hermes-agent -p hermes-gateway -p hermes-cli --all-targets`
-- Local debug gateway was tested with copied Armbian config at `/tmp/hermes-rs-local-test`; QQ output stopped truncating and Markdown rendered normally after the `msg_type=2` stream fix.
+Known gaps vs Python implementation:
+1. **工具调用进度反馈**（critical）：
+   - `AgentLoop::execute_tool_calls()` 静默执行，不通知 gateway
+   - 需要在工具执行期间调用回调通知进度
+   - Gateway 需要通过 `send_progress_card()` 显示工具执行状态
+2. **Progress card 实现**：QQ bot `send_progress_card()` 当前是空实现
+3. **流式并发冲突**：日志显示 40034021 "其它流式消息发送中"，需要改进流式状态管理
+
+Next immediate steps:
+1. 测试 typing indicator 是否工作
+2. 实现工具调用进度反馈：
+   - 在 `GatewayRuntimeContext` 添加进度回调
+   - `AgentLoop::execute_tool_calls()` 调用回调报告工具开始/完成
+   - Gateway 累积进度并通过 `send_progress_card()` 发送
+3. 实现 QQ bot `send_progress_card()` - 参考 Python adapter.py:802-839
+4. 修复流式并发冲突 - 改进 `c2c_stream_state` 锁管理
 
 Operational notes:
-- User prefers not compiling on the Armbian board for releases; use GitHub Actions for ARM64 release builds unless explicitly testing a local debug binary.
-- Fork remote for pushes/releases: `ysltr git@github.com:YsLtr/hermes-agent-rs.git`; upstream `origin` push previously failed with 403.
-- Armbian host: `root@192.168.11.11`; password was provided in chat. Use existing SSH helper scripts if needed.
-- Remote config: `/root/.hermes-rs/config.yaml`; original Python config/env live under `/root/.hermes/`.
-- User explicitly allowed copying existing secrets/config during this debugging session, but avoid committing secrets.
+- SSH 免密登录已配置：`ssh root@192.168.11.11`
+- Armbian config 已复制到 `/tmp/hermes-rs-local-test/config.yaml`
+- 本地测试命令：`cd /tmp/hermes-rs-local-test && /path/to/target/debug/hermes -C . gateway start`
+- 远程重启服务：`ssh root@192.168.11.11 'systemctl start hermes-rs-gateway.service'`
+- 原版 Python 代码在 Armbian：`/root/.hermes/hermes-agent/`
 
-Open risks / next steps:
-- Continue real QQ testing for longer tool loops and web/search/image tools; some failures seen during local testing were upstream LLM `429 Too Many Requests`, not gateway errors.
-- If QQ stream regressions recur, compare against Python custom implementation at `/root/.hermes/hermes-agent/gateway/platforms/qqbot/adapter.py`, especially `send_c2c_stream_chunk`.
-- Consider making native streaming vs ordinary Markdown final-message behavior configurable if the user wants notification/audio or different rendering tradeoffs.
-- Monitor logs for `40034016`, `40034021`, or `40054018` after more real traffic.
+完善计划将在下次会话制定，参考原版 Python 全功能清单。
 
-Suggested skills next session: `diagnose` for runtime QQ/tool-loop issues, `ssh-connect` for Armbian inspection, `handoff` before ending a long debugging session.
+Suggested skills next session: 无，直接继续实现工具进度反馈。
 
 ---
 

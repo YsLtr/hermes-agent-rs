@@ -1009,6 +1009,12 @@ impl Gateway {
             hook_payloads::agent_start(incoming, session_key, false),
         )
         .await;
+
+        // Send typing indicator if the platform supports it
+        if let Some(adapter) = self.adapters.read().await.get(&incoming.platform) {
+            let _ = adapter.send_typing(&incoming.chat_id).await;
+        }
+
         let deferred_messages = Arc::new(StdMutex::new(Vec::new()));
         let deferred_release = Arc::new(AtomicBool::new(false));
         let mut runtime_context = self.build_runtime_context(incoming, session_key).await;
@@ -1087,6 +1093,12 @@ impl Gateway {
             hook_payloads::agent_start(incoming, session_key, true),
         )
         .await;
+
+        // Send typing indicator if the platform supports it
+        if let Some(adapter) = self.adapters.read().await.get(&incoming.platform) {
+            let _ = adapter.send_typing(&incoming.chat_id).await;
+        }
+
         let deferred_messages = Arc::new(StdMutex::new(Vec::new()));
         let deferred_release = Arc::new(AtomicBool::new(false));
         let mut runtime_context = self.build_runtime_context(incoming, session_key).await;

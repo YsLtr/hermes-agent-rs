@@ -160,6 +160,13 @@ pub trait PlatformAdapter: Send + Sync {
         Ok(())
     }
 
+    /// Send a typing/input indicator to the chat (for platforms that support it).
+    ///
+    /// Default is a no-op. Debounce logic is handled by the adapter.
+    async fn send_typing(&self, _chat_id: &str) -> Result<(), GatewayError> {
+        Ok(())
+    }
+
     /// Periodic maintenance: prune token caches, dedup maps, etc.
     ///
     /// Default is a no-op. Adapters with long-lived in-memory caches should

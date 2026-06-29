@@ -21,6 +21,13 @@ const QQ_TOKEN_URL: &str = "https://bots.qq.com/app/getAppAccessToken";
 const QQ_API_BASE: &str = "https://api.sgroup.qq.com";
 const QQ_GATEWAY_URL: &str = "https://api.sgroup.qq.com/gateway";
 
+const MSG_TYPE_TEXT: i64 = 0;
+const MSG_TYPE_MARKDOWN: i64 = 2;
+const MSG_TYPE_INPUT_NOTIFY: i64 = 6;
+
+const TYPING_INPUT_SECONDS: i64 = 60;
+const TYPING_DEBOUNCE_SECONDS: u64 = 50;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QqBotConfig {
     pub app_id: String,
@@ -53,6 +60,8 @@ pub struct QqBotAdapter {
     turn_metadata: Mutex<std::collections::HashMap<String, PlatformTurnMetadata>>,
     progress_state: Mutex<std::collections::HashMap<String, ProgressState>>,
     notice_state: Mutex<StreamNoticeState>,
+    last_msg_id: Mutex<std::collections::HashMap<String, String>>,
+    typing_sent_at: Mutex<std::collections::HashMap<String, Instant>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -127,6 +136,8 @@ impl QqBotAdapter {
             turn_metadata: Mutex::new(std::collections::HashMap::new()),
             progress_state: Mutex::new(std::collections::HashMap::new()),
             notice_state: Mutex::new(StreamNoticeState::default()),
+            last_msg_id: Mutex::new(std::collections::HashMap::new()),
+            typing_sent_at: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -518,6 +529,15 @@ impl QqBotAdapter {
         if chat_id.is_empty() || user_id.is_empty() {
             return;
         }
+
+        // Store message ID for typing indicator
+        if let Some(ref id) = msg_id {
+            self.last_msg_id
+                .lock()
+                .await
+                .insert(chat_id.clone(), id.clone());
+        }
+
         let incoming = IncomingMessage {
             platform: "qqbot".to_string(),
             chat_id,
@@ -874,6 +894,60 @@ impl PlatformAdapter for QqBotAdapter {
         self.send_text_inner(chat_id, &line, false, true).await
     }
 
+    async fn send_typing(&self, chat_id: &str) -> Result<(), GatewayError> {
+        if !self.base.is_running() {
+            return Ok(());
+        }
+
+        // Only C2C supports typing indicator
+        if Self::looks_like_group_chat(chat_id) {
+            return Ok(());
+        }
+
+        // Need the originating message ID
+        let msg_id = {
+            let guard = self.last_msg_id.lock().await;
+            guard.get(chat_id).cloned()
+        };
+        let Some(msg_id) = msg_id else {
+            return Ok(());
+        };
+
+        // Debounce - skip if sent recently
+        let now = Instant::now();
+        {
+            let mut guard = self.typing_sent_at.lock().await;
+            if let Some(last) = guard.get(chat_id) {
+                if now.duration_since(*last) < Duration::from_secs(TYPING_DEBOUNCE_SECONDS) {
+                    return Ok(());
+                }
+            }
+            guard.insert(chat_id.to_string(), now);
+        }
+
+        let body = serde_json::json!({
+            "msg_type": MSG_TYPE_INPUT_NOTIFY,
+            "msg_id": msg_id,
+            "input_notify": {
+                "input_type": 1,
+                "input_second": TYPING_INPUT_SECONDS,
+            },
+            "msg_seq": Self::next_msg_seq(chat_id),
+        });
+
+        let endpoint = format!("{QQ_API_BASE}/v2/users/{chat_id}/messages");
+        match self.post_qq_message(&endpoint, body).await {
+            Ok(_) => {
+                debug!(chat_id = %chat_id, "QQBot sent typing indicator");
+                Ok(())
+            }
+            Err(e) => {
+                debug!(chat_id = %chat_id, error = %e, "QQBot send_typing failed (non-fatal)");
+                Ok(())
+            }
+        }
+    }
+
     async fn maintenance_prune(&self) {
         // Keep the tiny maps bounded if sessions vanish without a final send.
         const MAX_TRACKED_CHATS: usize = 512;
@@ -890,6 +964,16 @@ impl PlatformAdapter for QqBotAdapter {
         let mut meta = self.turn_metadata.lock().await;
         if meta.len() > MAX_TRACKED_CHATS {
             meta.clear();
+        }
+        drop(meta);
+        let mut last_msg = self.last_msg_id.lock().await;
+        if last_msg.len() > MAX_TRACKED_CHATS {
+            last_msg.clear();
+        }
+        drop(last_msg);
+        let mut typing = self.typing_sent_at.lock().await;
+        if typing.len() > MAX_TRACKED_CHATS {
+            typing.clear();
         }
     }
 }
