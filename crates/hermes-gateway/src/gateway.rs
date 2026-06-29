@@ -1140,6 +1140,8 @@ impl Gateway {
         let native_adapter_for_chunks = native_stream_adapter.clone();
         let first_token_for_chunks = first_token_at.clone();
         let native_requested_for_chunks = native_stream_requested.clone();
+        let native_streamed_text = Arc::new(StdMutex::new(String::new()));
+        let native_streamed_text_for_chunks = native_streamed_text.clone();
         let (native_chunk_tx, native_worker) = if let Some(adapter) = native_stream_adapter.clone()
         {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -1167,6 +1169,7 @@ impl Gateway {
             let reply_to = reply_to.clone();
             let first_token_at = first_token_for_chunks.clone();
             let native_requested = native_requested_for_chunks.clone();
+            let native_streamed_text = native_streamed_text_for_chunks.clone();
             if native_adapter.is_some() || native_chunk_tx.is_some() {
                 native_requested.store(true, Ordering::Release);
             }
@@ -1176,6 +1179,9 @@ impl Gateway {
                         if first.is_none() {
                             *first = Some(std::time::Instant::now());
                         }
+                    }
+                    if let Ok(mut streamed) = native_streamed_text.lock() {
+                        streamed.push_str(&chunk);
                     }
                 }
                 let _ = tx.send(chunk);
@@ -1319,6 +1325,26 @@ impl Gateway {
                     let _ = notice_adapter.send_stream_end_notice(&chat_id).await;
                 });
             }
+        }
+        let native_streamed_chars = native_streamed_text
+            .lock()
+            .map(|text| text.trim().chars().count())
+            .unwrap_or(0);
+        let response_chars = response.trim().chars().count();
+        if had_native_stream_adapter
+            && native_delivered
+            && response_chars > 0
+            && native_streamed_chars.saturating_add(32) < response_chars
+        {
+            warn!(
+                platform = %incoming.platform,
+                chat_id = %incoming.chat_id,
+                streamed_chars = native_streamed_chars,
+                response_chars,
+                "native stream appears incomplete; sending full response fallback"
+            );
+            self.send_message(&incoming.platform, &incoming.chat_id, &response, None)
+                .await?;
         }
         if had_native_stream_adapter && !native_delivered && !response.trim().is_empty() {
             self.send_message(&incoming.platform, &incoming.chat_id, &response, None)

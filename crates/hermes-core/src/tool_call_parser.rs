@@ -71,6 +71,41 @@ impl ToolCallParser for HermesToolCallParser {
             }
         }
 
+        // Some OpenAI-compatible providers emit a compact XML-ish format:
+        // <tool_call>name<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>
+        // Treat it as a normal tool call instead of leaking the tag to users.
+        if calls.is_empty() {
+            let compact_re =
+                Regex::new(r"(?s)<tool_call>\s*([^<\s]+)\s*(.*?)</tool_call>").unwrap();
+            let arg_pair_re =
+                Regex::new(r"(?s)<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>").unwrap();
+            for caps in compact_re.captures_iter(content) {
+                let name = caps.get(1).unwrap().as_str().trim().to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let args_block = caps.get(2).map(|m| m.as_str()).unwrap_or("");
+                let mut args = serde_json::Map::new();
+                for pair in arg_pair_re.captures_iter(args_block) {
+                    let key = pair.get(1).unwrap().as_str().trim();
+                    if key.is_empty() {
+                        continue;
+                    }
+                    let raw = pair.get(2).unwrap().as_str().trim();
+                    let val = serde_json::from_str(raw)
+                        .unwrap_or_else(|_| serde_json::Value::String(raw.to_string()));
+                    args.insert(key.to_string(), val);
+                }
+                calls.push(ToolCall {
+                    id: next_call_id(),
+                    function: FunctionCall {
+                        name,
+                        arguments: serde_json::Value::Object(args).to_string(),
+                    },
+                });
+            }
+        }
+
         // Also try ```tool_call blocks if no XML calls were found
         if calls.is_empty() {
             let tool_call_re = Regex::new(r"(?s)```tool_call\s*\n(.*?)\n```").unwrap();
@@ -135,6 +170,10 @@ pub fn separate_text_and_calls(content: &str) -> (String, Vec<ToolCall>) {
     // Remove ```tool_call ... ``` blocks
     let tool_call_re = Regex::new(r"(?s)```tool_call\s*\n.*?\n```").unwrap();
     result = tool_call_re.replace_all(&result, "").to_string();
+
+    // Remove compact <tool_call>...</tool_call> blocks
+    let compact_tool_call_re = Regex::new(r"(?s)<tool_call>.*?</tool_call>").unwrap();
+    result = compact_tool_call_re.replace_all(&result, "").to_string();
 
     // Trim excessive whitespace left behind
     let result = result.trim().to_string();
@@ -236,6 +275,21 @@ Let me run that.
         assert_eq!(calls[0].function.name, "calculator");
         let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
         assert_eq!(args["expr"], "2+2");
+    }
+
+    #[test]
+    fn test_parse_compact_tool_call_tags() {
+        let content = r#"
+给你找点原神相关的表情包！
+
+<tool_call>gif_search<arg_key>query</arg_key><arg_value>Genshin Impact funny meme</arg_value></tool_call>
+"#;
+        let (text, calls) = separate_text_and_calls(content);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "gif_search");
+        assert!(!text.contains("<tool_call>"));
+        let args: serde_json::Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+        assert_eq!(args["query"], "Genshin Impact funny meme");
     }
 
     #[test]

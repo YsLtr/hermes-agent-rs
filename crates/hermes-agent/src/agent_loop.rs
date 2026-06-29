@@ -20,8 +20,8 @@ use tokio::task::JoinSet;
 use tokio::time::sleep;
 
 use hermes_core::{
-    AgentError, AgentResult, BudgetConfig, LlmProvider, LlmResponse, Message, MessageRole,
-    StreamChunk, ToolCall, ToolError, ToolResult, ToolSchema, UsageStats,
+    separate_text_and_calls, AgentError, AgentResult, BudgetConfig, LlmProvider, LlmResponse,
+    Message, MessageRole, StreamChunk, ToolCall, ToolError, ToolResult, ToolSchema, UsageStats,
 };
 
 use crate::api_bridge::CodexProvider;
@@ -3029,7 +3029,8 @@ impl AgentLoop {
                 .get_messages()
                 .iter()
                 .any(|m| m.role == MessageRole::Tool);
-            let assistant_msg = response.message.clone();
+            let mut assistant_msg = response.message.clone();
+            Self::promote_text_tool_calls(&mut assistant_msg);
             let tool_calls = assistant_msg.tool_calls.clone();
             ctx.add_message(assistant_msg.clone());
             if assistant_msg
@@ -3809,7 +3810,8 @@ impl AgentLoop {
                 .get_messages()
                 .iter()
                 .any(|m| m.role == MessageRole::Tool);
-            let assistant_msg = response.message.clone();
+            let mut assistant_msg = response.message.clone();
+            Self::promote_text_tool_calls(&mut assistant_msg);
             let tool_calls = assistant_msg.tool_calls.clone();
             ctx.add_message(assistant_msg.clone());
             if assistant_msg
@@ -4200,6 +4202,38 @@ impl AgentLoop {
             }
         }
         deduped
+    }
+
+    fn promote_text_tool_calls(message: &mut Message) {
+        if message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|calls| !calls.is_empty())
+        {
+            return;
+        }
+        let Some(content) = message.content.as_deref() else {
+            return;
+        };
+        let (text, calls) = separate_text_and_calls(content);
+        if calls.is_empty() {
+            return;
+        }
+        tracing::info!(
+            tool_count = calls.len(),
+            tools = %calls
+                .iter()
+                .map(|tc| tc.function.name.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            "promoted text tool calls"
+        );
+        message.content = if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        };
+        message.tool_calls = Some(calls);
     }
 
     /// Try to repair an unknown tool name via case-insensitive or substring matching.

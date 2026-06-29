@@ -584,11 +584,24 @@ async fn run_gateway(cli: Cli, action: Option<String>) -> Result<(), AgentError>
                             agent.tool_registry.clone(),
                             agent.llm_provider.clone(),
                         );
+                        let compact_tool_call_filter =
+                            Arc::new(std::sync::Mutex::new(String::new()));
                         let chunk_cb: Option<Box<dyn Fn(hermes_core::StreamChunk) + Send + Sync>> =
                             Some(Box::new(move |chunk| {
                                 if let Some(content) = chunk.delta.and_then(|delta| delta.content) {
                                     if !content.is_empty() {
-                                        on_chunk(content);
+                                        let filtered = compact_tool_call_filter
+                                            .lock()
+                                            .map(|mut buffer| {
+                                                filter_compact_tool_call_stream_chunk(
+                                                    &mut buffer,
+                                                    &content,
+                                                )
+                                            })
+                                            .unwrap_or(content);
+                                        if !filtered.is_empty() {
+                                            on_chunk(filtered);
+                                        }
                                     }
                                 }
                             }));
@@ -1267,6 +1280,46 @@ fn last_assistant_text(messages: &[Message]) -> String {
         .unwrap_or("")
         .trim()
         .to_string()
+}
+
+fn filter_compact_tool_call_stream_chunk(buffer: &mut String, chunk: &str) -> String {
+    buffer.push_str(chunk);
+    let mut out = String::new();
+    loop {
+        let Some(start) = buffer.find("<tool_call>") else {
+            let keep = compact_tool_call_prefix_tail_len(buffer);
+            if keep == 0 {
+                out.push_str(buffer);
+                buffer.clear();
+            } else if buffer.len() > keep {
+                let emit_len = buffer.len() - keep;
+                out.push_str(&buffer[..emit_len]);
+                let tail = buffer[emit_len..].to_string();
+                *buffer = tail;
+            }
+            break;
+        };
+        out.push_str(&buffer[..start]);
+        let Some(rel_end) = buffer[start..].find("</tool_call>") else {
+            let tail = buffer[start..].to_string();
+            *buffer = tail;
+            break;
+        };
+        let end = start + rel_end + "</tool_call>".len();
+        buffer.drain(..end);
+    }
+    out
+}
+
+fn compact_tool_call_prefix_tail_len(text: &str) -> usize {
+    const PREFIX: &str = "<tool_call>";
+    let max = text.len().min(PREFIX.len() - 1);
+    for len in (1..=max).rev() {
+        if text.ends_with(&PREFIX[..len]) {
+            return len;
+        }
+    }
+    0
 }
 
 async fn build_gateway_agent(
