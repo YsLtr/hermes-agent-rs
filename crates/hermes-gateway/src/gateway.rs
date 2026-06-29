@@ -1140,6 +1140,21 @@ impl Gateway {
         let native_adapter_for_chunks = native_stream_adapter.clone();
         let first_token_for_chunks = first_token_at.clone();
         let native_requested_for_chunks = native_stream_requested.clone();
+        let (native_chunk_tx, native_worker) = if let Some(adapter) = native_stream_adapter.clone()
+        {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+            let chat_id = incoming.chat_id.clone();
+            let reply_to = incoming.message_id.clone();
+            let platform = incoming.platform.clone();
+            (
+                Some(tx),
+                Some(tokio::spawn(async move {
+                    Self::pump_native_stream_chunks(adapter, platform, chat_id, reply_to, rx).await
+                })),
+            )
+        } else {
+            (None, None)
+        };
 
         let on_chunk: Arc<dyn Fn(String) + Send + Sync> = Arc::new(move |chunk: String| {
             let sm = stream_manager.clone();
@@ -1148,11 +1163,23 @@ impl Gateway {
             let chat_id = chat_id.clone();
             let adapters = gateway_adapters.clone();
             let native_adapter = native_adapter_for_chunks.clone();
+            let native_chunk_tx = native_chunk_tx.clone();
             let reply_to = reply_to.clone();
             let first_token_at = first_token_for_chunks.clone();
             let native_requested = native_requested_for_chunks.clone();
-            if native_adapter.is_some() {
+            if native_adapter.is_some() || native_chunk_tx.is_some() {
                 native_requested.store(true, Ordering::Release);
+            }
+            if let Some(tx) = native_chunk_tx {
+                if !chunk.is_empty() {
+                    if let Ok(mut first) = first_token_at.lock() {
+                        if first.is_none() {
+                            *first = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+                let _ = tx.send(chunk);
+                return;
             }
 
             tokio::spawn(async move {
@@ -1177,8 +1204,9 @@ impl Gateway {
                                 platform = %platform,
                                 chat_id = %chat_id,
                                 error = %err,
-                                "native stream chunk failed; falling back to gateway send path"
+                                "native stream chunk failed"
                             );
+                            return;
                         }
                     }
                 }
@@ -1225,6 +1253,10 @@ impl Gateway {
                 return Err(e);
             }
         };
+        if let Some(worker) = native_worker {
+            let _ = worker.await;
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
 
         let final_content = self
             .stream_manager
@@ -1313,6 +1345,83 @@ impl Gateway {
         .await;
 
         Ok(())
+    }
+
+    async fn pump_native_stream_chunks(
+        adapter: Arc<dyn PlatformAdapter>,
+        platform: String,
+        chat_id: String,
+        reply_to: Option<String>,
+        mut rx: tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let mut buffer = String::new();
+        let mut sent_any = false;
+        let flush_interval = std::time::Duration::from_millis(450);
+        let min_send_gap = std::time::Duration::from_millis(250);
+        let mut last_send_at: Option<std::time::Instant> = None;
+
+        loop {
+            match tokio::time::timeout(flush_interval, rx.recv()).await {
+                Ok(Some(chunk)) => {
+                    buffer.push_str(&chunk);
+                    if buffer.chars().count() < 24 {
+                        continue;
+                    }
+                }
+                Ok(None) => {
+                    if buffer.trim().is_empty() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    if buffer.trim().is_empty() {
+                        continue;
+                    }
+                }
+            }
+
+            if let Some(last) = last_send_at {
+                let elapsed = last.elapsed();
+                if elapsed < min_send_gap {
+                    tokio::time::sleep(min_send_gap - elapsed).await;
+                }
+            }
+
+            let chunk = std::mem::take(&mut buffer);
+            match adapter
+                .send_stream_chunk(&chat_id, &chunk, reply_to.as_deref(), false)
+                .await
+            {
+                Ok(true) => {
+                    sent_any = true;
+                    last_send_at = Some(std::time::Instant::now());
+                }
+                Ok(false) => {
+                    warn!(
+                        platform = %platform,
+                        chat_id = %chat_id,
+                        sent_any,
+                        "native stream worker adapter declined chunk"
+                    );
+                    break;
+                }
+                Err(err) => {
+                    warn!(
+                        platform = %platform,
+                        chat_id = %chat_id,
+                        error = %err,
+                        sent_any,
+                        "native stream worker failed to send chunk"
+                    );
+                    buffer.clear();
+                    last_send_at = Some(std::time::Instant::now());
+                }
+            }
+
+            if rx.is_closed() && buffer.trim().is_empty() {
+                break;
+            }
+        }
     }
 
     async fn inject_runtime_hints(
@@ -3017,10 +3126,7 @@ mod tests {
         let chunks = chunks.lock().unwrap();
         assert!(chunks
             .iter()
-            .any(|(_, text, final_chunk)| text == "hello " && !final_chunk));
-        assert!(chunks
-            .iter()
-            .any(|(_, text, final_chunk)| text == "qq" && !final_chunk));
+            .any(|(_, text, final_chunk)| text == "hello qq" && !final_chunk));
         assert!(chunks
             .iter()
             .any(|(_, text, final_chunk)| text.is_empty() && *final_chunk));
